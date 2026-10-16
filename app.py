@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════
-#  TEAM RBC — Squad Bot (2v2 Mode - Create → Invite → Accept → PK)
+#  TEAM RBC — Squad Bot (2v2 Parallel Teams)
 # ═══════════════════════════════════════════════════════════════════
 import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid
 import itertools, secrets, traceback, base64
@@ -42,7 +42,6 @@ EXP_REFRESH_AFTER_MATCH_DELAY = 9.0
 MAX_CONSECUTIVE_PARSE_FAILURES = 5
 NON_MATCH_RECONNECT_DELAY      = 1.0
 
-# ⭐ Only Battle Royale
 BR_MODE_ID             = 1
 BR_MAP_ID              = 1
 
@@ -98,7 +97,7 @@ TEAM_MEMBER_START_DELAY = 20.0
 TEAM_FINAL_WAIT         = 8.0
 TEAM_READY_DELAY        = 5.0
 _accept_friend_request  = True
-DEBUG_TEAM_PACKETS      = True
+DEBUG_TEAM_PACKETS      = False  # ⭐ Reduced for cleaner logs
 
 # ═══════════════════════════ ANTI-BAN ═══════════════════════════
 def bypass_jitter(base, spread=0.35):
@@ -284,47 +283,150 @@ async def _get_total_match_count():
     async with _match_counter_lock:
         return sum(_match_counters.values())
 
-# ═══════════════════════════ SQUAD STATE ═══════════════════════════
-_team_state = {
-    "peers": {},
-    "leader_uid": None,
-    "team_code": None,
-    "pk_code": None,
-    "members": set(),
-    "members_lock": asyncio.Lock(),
-    "lock": asyncio.Lock(),
-}
+# ═══════════════════════════════════════════════════════════════════════
+# ⭐ MAJOR CHANGE: PARALLEL TEAMS SYSTEM
+# Each 2-peer pair forms an INDEPENDENT team. Multiple teams can run
+# simultaneously without interfering with each other.
+# ═══════════════════════════════════════════════════════════════════════
 
+# Global lock for assigning/releasing peers to team slots
+_teams_lock = asyncio.Lock()
+
+# Team slots: team_id -> { "leader": uid, "members": set, "team_code": str, "pk_code": str }
+_team_slots: Dict[str, Dict[str, Any]] = {}
+
+# Per-account peer info: uid -> { writer, data, key, iv, team_id, is_leader }
+_peer_registry: Dict[str, Dict[str, Any]] = {}
+
+# Global writer lock
+_global_team_lock = asyncio.Lock()
+
+async def _register_peer(uid: str, writer, account_data, key, iv):
+    """Register a peer with the global registry"""
+    async with _global_team_lock:
+        _peer_registry[str(uid)] = {
+            "writer": writer,
+            "data": account_data,
+            "key": key,
+            "iv": iv,
+            "team_id": None,
+            "is_leader": False,
+        }
+
+async def _unregister_peer(uid: str):
+    """Remove peer from registry and free up its team slot"""
+    uid_str = str(uid)
+    async with _global_team_lock:
+        peer = _peer_registry.pop(uid_str, None)
+        if peer and peer.get("team_id"):
+            team_id = peer["team_id"]
+            if team_id in _team_slots:
+                _team_slots[team_id]["members"].discard(uid_str)
+                # If no members left, remove team
+                if not _team_slots[team_id]["members"]:
+                    del _team_slots[team_id]
+
+async def _try_assign_team(uid: str):
+    """
+    Try to assign this peer to a team.
+    Returns: (team_id, is_leader) or (None, False)
+    
+    Logic:
+    1. First, check if there's an existing team with 1 member (needs partner)
+    2. If yes, join as member
+    3. If no, create a new team and become leader
+    """
+    uid_str = str(uid)
+    async with _global_team_lock:
+        peer = _peer_registry.get(uid_str)
+        if not peer:
+            return None, False
+        if peer.get("team_id"):
+            return peer["team_id"], peer["is_leader"]
+        
+        # Look for existing team with exactly 1 member (needs partner)
+        for team_id, team in _team_slots.items():
+            if len(team["members"]) == 1:
+                # Join this team as member
+                team["members"].add(uid_str)
+                peer["team_id"] = team_id
+                peer["is_leader"] = False
+                print_success(f"[TEAM-SLOT] {uid_str} joined existing team {team_id} as MEMBER ({len(team['members'])}/{TEAM_SIZE})")
+                return team_id, False
+        
+        # No existing team → create new team as leader
+        team_id = f"team_{uid_str}_{int(time.time())}"
+        _team_slots[team_id] = {
+            "leader": uid_str,
+            "members": {uid_str},
+            "team_code": None,
+            "pk_code": None,
+            "created_at": time.time(),
+        }
+        peer["team_id"] = team_id
+        peer["is_leader"] = True
+        print_success(f"[TEAM-SLOT] 👑 {uid_str} created NEW team {team_id} as LEADER (1/{TEAM_SIZE})")
+        return team_id, True
+
+async def _get_team_info(team_id: str):
+    """Get team info snapshot"""
+    async with _global_team_lock:
+        team = _team_slots.get(team_id)
+        if not team:
+            return None
+        return {
+            "team_id": team_id,
+            "leader": team["leader"],
+            "members": set(team["members"]),
+            "team_code": team.get("team_code"),
+            "pk_code": team.get("pk_code"),
+        }
+
+async def _team_member_count(team_id: str):
+    async with _global_team_lock:
+        team = _team_slots.get(team_id)
+        return len(team["members"]) if team else 0
+
+async def _team_member_leave(uid: str):
+    """Remove peer from its team slot"""
+    uid_str = str(uid)
+    async with _global_team_lock:
+        peer = _peer_registry.get(uid_str)
+        if not peer: return
+        team_id = peer.get("team_id")
+        if team_id and team_id in _team_slots:
+            _team_slots[team_id]["members"].discard(uid_str)
+            if not _team_slots[team_id]["members"]:
+                del _team_slots[team_id]
+
+async def _update_team_code(team_id: str, code: str):
+    async with _global_team_lock:
+        if team_id in _team_slots:
+            _team_slots[team_id]["team_code"] = code
+
+async def _update_pk_code(team_id: str, code: str):
+    async with _global_team_lock:
+        if team_id in _team_slots:
+            _team_slots[team_id]["pk_code"] = code
+
+# Legacy compat functions (deprecated but keeping for safety)
 async def _team_member_join(uid):
     uid = str(uid)
-    async with _team_state["members_lock"]:
-        before = len(_team_state["members"])
-        _team_state["members"].add(uid)
-        after = len(_team_state["members"])
-    if after != before:
-        print_success(f"[TEAM] 👥 In team ({after}/{TEAM_SIZE}) | joined: {uid}")
+    team_id, is_leader = await _try_assign_team(uid)
+    if team_id:
+        count = await _team_member_count(team_id)
+        role = "LEADER" if is_leader else "MEMBER"
+        print_success(f"[TEAM] 👥 In team ({count}/{TEAM_SIZE}) | joined: {uid} [{role}]")
         try:
-            for p_uid in list(_team_state["peers"].keys()):
-                role = "LEADER" if _team_state["leader_uid"] == p_uid else "MEMBER"
-                joined = p_uid in _team_state["members"]
-                tag = f"IN_TEAM ({after}/{TEAM_SIZE}) [{role}]" if joined else f"JOINING ({after}/{TEAM_SIZE}) [{role}]"
-                bot_state.update_status(p_uid, tag, 0)
+            for p_uid in list(_peer_registry.keys()):
+                p = _peer_registry.get(p_uid)
+                if p and p.get("team_id") == team_id:
+                    bot_state.update_status(p_uid, f"IN_TEAM ({count}/{TEAM_SIZE})", 0)
         except Exception: pass
-    return after
-
-async def _team_member_leave(uid):
-    async with _team_state["members_lock"]:
-        _team_state["members"].discard(str(uid))
-
-async def _team_member_count():
-    async with _team_state["members_lock"]:
-        return len(_team_state["members"])
+    return count if team_id else 0
 
 async def _team_member_reset(keep_leader=True):
-    async with _team_state["members_lock"]:
-        _team_state["members"].clear()
-        if keep_leader and _team_state["leader_uid"]:
-            _team_state["members"].add(_team_state["leader_uid"])
+    pass  # No-op for parallel teams
 
 # ═══════════════════════════ TOKEN CACHE ═══════════════════════════
 _token_cache_memo = {}
@@ -1495,13 +1597,10 @@ def _wrap_manual(inner):
     except Exception: pass
     return None
 
-# ═══════════════════════════ TEAM INVITE HANDLER ═══════════════════════════
+# ═══════════════════════════ TEAM INVITE HANDLER (PARALLEL AWARE) ═══════════════════════════
 async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
-                              current_key, current_iv, writer):
+                              current_key, current_iv, writer, team_id):
     try:
-        if DEBUG_TEAM_PACKETS:
-            print_info(f"[TEAM-IN {uid_str}] len={pl} hex={hex_data[:80]}")
-
         candidates = []
         for off in [10, 8, 6, 12, 14, 4, 16, 0, 20, 2]:
             if off >= len(hex_data) or len(hex_data) - off < 4: continue
@@ -1521,7 +1620,6 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
 
         candidates.sort(key=lambda x: len(x[2]) if isinstance(x[2], dict) else 0, reverse=True)
         best_off, decoder, dec = candidates[0]
-        print_info(f"[TEAM-IN {uid_str}] decoded@{best_off}/{decoder} fields={list(dec.keys())[:20]}")
 
         def _unwrap(d, keys):
             if not isinstance(d, dict): return None
@@ -1536,7 +1634,6 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
             u = _unwrap(dec, kp)
             if isinstance(u, dict) and len(u) >= 3:
                 target_dict = u
-                print_info(f"[TEAM-IN {uid_str}] nested@{kp[0]}")
                 break
         if target_dict is None: target_dict = dec
 
@@ -1554,16 +1651,12 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
         for k in list(target_dict.keys()):
             c = _g(target_dict, k)
             if isinstance(c, str) and 20 <= len(c) <= 40:
-                group_id = c
-                print_success(f"[TEAM-IN {uid_str}] 📋 group_id@f{k}: {c[:24]}...")
-                break
+                group_id = c; break
         if not group_id:
             for k in list(dec.keys()):
                 c = _g(dec, k)
                 if isinstance(c, str) and 20 <= len(c) <= 40:
-                    group_id = c
-                    print_success(f"[TEAM-IN {uid_str}] 📋 group_id@root.f{k}: {c[:24]}...")
-                    break
+                    group_id = c; break
 
         own_acc = str(current_account_data.get('account_id')) if current_account_data else None
         inviter = None
@@ -1572,47 +1665,43 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
             c = _g(target_dict, k) or _g(dec, k)
             if c and str(c).isdigit() and 6 <= len(str(c)) <= 15:
                 if str(c) != uid_str and str(c) != own_acc:
-                    inviter = str(c)
-                    print_success(f"[TEAM-IN {uid_str}] 👤 inviter@f{k}: {c}")
-                    break
+                    inviter = str(c); break
 
-        tc = None
-        for k in all_f:
-            c = _g(target_dict, k) or _g(dec, k)
-            if c and str(c).isdigit() and len(str(c)) == 7:
-                tc = str(c); break
-        if tc:
-            async with _team_state["lock"]:
-                _team_state["team_code"] = tc
-            print_success(f"[TEAM-IN {uid_str}] 📢 Team Code: {tc}")
+        # Check if we're a member of this team (not leader)
+        peer = _peer_registry.get(uid_str)
+        is_member = peer and not peer.get("is_leader")
 
-        is_member = (_team_state["leader_uid"] != uid_str)
         if inviter and group_id and is_member:
-            async with _team_state["members_lock"]:
-                already = uid_str in _team_state["members"]
+            # Check if we already joined
+            async with _global_team_lock:
+                p = _peer_registry.get(uid_str)
+                team = _team_slots.get(team_id) if team_id else None
+                already = team and uid_str in team["members"] and len(team["members"]) >= TEAM_SIZE
+
             if already:
                 return True
-            print_success(f"[TEAM-IN {uid_str}] 📨 ACCEPT: inviter={inviter} group={group_id[:16]}...")
+
+            print_success(f"[TEAM-IN {uid_str}] 📨 ACCEPT: inviter={inviter}")
             accepted = False
             for attempt in range(3):
                 try:
                     acc = accept_team_invite(int(inviter), group_id, current_key, current_iv)
                     if writer and not writer.is_closing():
                         writer.write(acc); await writer.drain()
-                        print_success(f"[TEAM-IN {uid_str}] ✅ accept #{attempt+1} ({len(acc)}B)")
+                        print_success(f"[TEAM-IN {uid_str}] ✅ accept #{attempt+1}")
                         accepted = True; break
                 except Exception as e:
                     print_warning(f"[TEAM-IN {uid_str}] accept err #{attempt+1}: {e}")
                 await asyncio.sleep(0.8)
-            if accepted:
-                await _team_member_join(uid_str)
             return True
         return False
     except Exception as e:
         print_warning(f"[TEAM-IN {uid_str}] error: {e}")
         return False
 
-# ═══════════════════════════ FUNCTIONAL (MAIN) — 2v2 BATTLE ROYALE ═══════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# FUNCTIONAL — 2v2 PARALLEL BATTLE ROYALE
+# ═══════════════════════════════════════════════════════════════════════
 async def functional_battle_royale(addrs, starter_packet, account_region, client_version,
                                     key, iv, account_id="", account_data=None,
                                     account_level=2, max_reconnects=10):
@@ -1633,6 +1722,8 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
     current_search_region = REGION_ROTATION_LIST[0]
     _writer_ref = {"w": None}
     _team_active = {"flag": True}
+    _my_team_id = {"id": None}
+    _my_is_leader = {"flag": False}
 
     async def trigger_post_match_refresh():
         await asyncio.sleep(EXP_REFRESH_AFTER_MATCH_DELAY)
@@ -1641,36 +1732,35 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
             if cd: await refresh_account_profile(cd)
         except Exception: pass
 
-    # ═══════════ LEADER: create → invite-loop → ready → start ═══════════
+    # ═══════════ PER-TEAM COORDINATOR ═══════════
     async def _team_coordinator():
+        """Coordinator runs ONLY for team leaders"""
         try:
+            team_id = _my_team_id["id"]
+            if not team_id:
+                print_warning(f"[TEAM] {uid_str} no team_id set, skipping coordinator")
+                return
+
+            # Wait for partner to join (up to TEAM_PEER_WAIT_TIMEOUT)
             deadline = time.time() + TEAM_PEER_WAIT_TIMEOUT
             while time.time() < deadline:
-                async with _team_state["lock"]:
-                    n = len(_team_state["peers"])
-                if n >= TEAM_SIZE: break
-                if bot_state.is_paused(uid_str): return
+                cnt = await _team_member_count(team_id)
+                if cnt >= TEAM_SIZE:
+                    print_success(f"[TEAM] {uid_str} team {team_id}: partner joined ({cnt}/{TEAM_SIZE})")
+                    break
+                if bot_state.is_paused(uid_str):
+                    return
                 await asyncio.sleep(0.5)
 
-            async with _team_state["lock"]:
-                n = len(_team_state["peers"])
-                is_leader = (_team_state["leader_uid"] == uid_str)
-                peers_snapshot = dict(_team_state["peers"])
+            cnt = await _team_member_count(team_id)
+            if cnt < TEAM_SIZE:
+                print_warning(f"[TEAM] {uid_str} partner timeout ({cnt}/{TEAM_SIZE})")
+                # Continue anyway — might get filled later
 
-            if not is_leader:
-                print_info(f"[TEAM] {uid_str} waiting as member...")
-                return
-            if n < TEAM_SIZE:
-                print_warning(f"[TEAM] Only {n}/{TEAM_SIZE} peers")
-            else:
-                print_success(f"[TEAM] ✅ All {n} peers online")
+            print_success(f"[TEAM] 👑 {uid_str} creating team (id={team_id[-12:]})...")
 
-            await asyncio.sleep(TEAM_READY_DELAY)
-            print_success(f"[TEAM] 👑 {uid_str} creating team...")
-
-            async with _team_state["lock"]:
-                _team_state["team_code"] = None
-                _team_state["pk_code"] = None
+            team_info = await _get_team_info(team_id)
+            if not team_info: return
 
             own_id_num = None
             if current_account_data: own_id_num = current_account_data.get('account_id')
@@ -1678,27 +1768,28 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 try: own_id_num = int(uid_str)
                 except Exception: own_id_num = 0
 
+            # Send create_team packet
             try:
                 pkt = create_team(current_key, current_iv, client_version)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
                     print_info(f"[TEAM] create_team sent ({len(pkt)}B)")
-                    await _team_member_reset(keep_leader=False)
-                    await _team_member_join(uid_str)
             except Exception as e:
                 print_error(f"[TEAM] create_team: {e}")
 
             await asyncio.sleep(TEAM_CREATE_WAIT)
 
+            # Get partners (not me)
             peer_uids = []
-            for peer_uid, info in peers_snapshot.items():
-                if peer_uid == uid_str: continue
-                pa = None
-                try: pa = info["data"].get("account_id")
-                except Exception: pass
-                if not pa: pa = peer_uid
-                peer_uids.append(int(pa))
-            print_info(f"[TEAM] Will invite {len(peer_uids)} peers: {peer_uids}")
+            for member_uid in team_info["members"]:
+                if member_uid == uid_str: continue
+                m_peer = _peer_registry.get(member_uid)
+                if m_peer:
+                    pa = m_peer["data"].get("account_id") or member_uid
+                    peer_uids.append(int(pa))
+                else:
+                    peer_uids.append(int(member_uid))
+            print_info(f"[TEAM] Inviting {len(peer_uids)} peers: {peer_uids}")
 
             heartbeat_stop = asyncio.Event()
             async def heartbeat_loop():
@@ -1712,20 +1803,21 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     except asyncio.TimeoutError: pass
             hb_task = asyncio.create_task(heartbeat_loop())
 
-            print_success(f"[TEAM] 🎯 Invite-loop start (max {int(TEAM_INVITE_MAX_TIME)}s)")
+            # Invite loop until we have TEAM_SIZE members
             invite_start = time.time()
             cycle = 0
             while time.time() - invite_start < TEAM_INVITE_MAX_TIME:
                 if not _team_active["flag"]: break
                 if bot_state.is_paused(uid_str): break
-                cnt = await _team_member_count()
+                cnt = await _team_member_count(team_id)
                 if cnt >= TEAM_SIZE:
-                    print_success(f"[TEAM] 🎉 Full team ({cnt}/{TEAM_SIZE})!")
+                    print_success(f"[TEAM] 🎉 Team {team_id[-8:]} full ({cnt}/{TEAM_SIZE})!")
                     break
                 cycle += 1
-                for i, tuid in enumerate(peer_uids):
-                    async with _team_state["members_lock"]:
-                        joined = str(tuid) in _team_state["members"]
+                for tuid in peer_uids:
+                    async with _global_team_lock:
+                        team = _team_slots.get(team_id)
+                        joined = team and str(tuid) in team["members"]
                     if joined: continue
                     try:
                         inv = invite_player_in_team(tuid, current_key, current_iv, region=account_region)
@@ -1738,27 +1830,21 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 try: await asyncio.wait_for(heartbeat_stop.wait(), timeout=TEAM_INVITE_CYCLE_WAIT)
                 except asyncio.TimeoutError: pass
 
-            final_cnt = await _team_member_count()
-            print_colored(f"[TEAM] ══ FINAL: In team ({final_cnt}/{TEAM_SIZE}) ══", Colors.MAGENTA)
-
-            if final_cnt < TEAM_SIZE:
-                print_error(f"[TEAM] Only {final_cnt}/{TEAM_SIZE} joined — abort, retry")
-                heartbeat_stop.set()
-                try: hb_task.cancel(); await hb_task
-                except Exception: pass
-                return
+            final_cnt = await _team_member_count(team_id)
+            print_colored(f"[TEAM] ══ FINAL: Team {team_id[-8:]} has ({final_cnt}/{TEAM_SIZE}) ══", Colors.MAGENTA)
 
             await asyncio.sleep(TEAM_FINAL_WAIT)
             heartbeat_stop.set()
             try: hb_task.cancel(); await hb_task
             except Exception: pass
 
-            print_success(f"[TEAM] 🚀 {uid_str} loop: ready → 1s → start (every 5s)")
+            # Ready → Start loop
+            print_success(f"[TEAM] 🚀 Leader {uid_str} starting ready→start loop for team {team_id[-8:]}")
             while _team_active["flag"]:
                 try:
                     if bot_state.is_paused(uid_str): break
-                    async with _team_state["lock"]:
-                        if _team_state["leader_uid"] != uid_str: break
+                    if _my_team_id["id"] != team_id: break  # team changed
+                    
                     oid = current_account_data.get('account_id', own_id_num) if current_account_data else own_id_num
                     try:
                         rdy = ready_for_game(int(oid), current_key, current_iv)
@@ -1778,15 +1864,27 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
             traceback.print_exc()
 
     async def _member_match_trigger():
+        """Member side: sends ready→start after leader creates team"""
         try:
+            team_id = _my_team_id["id"]
+            if not team_id: return
+            
             await asyncio.sleep(TEAM_READY_DELAY + TEAM_MEMBER_START_DELAY)
-            async with _team_state["lock"]:
-                if _team_state["leader_uid"] == uid_str: return
-            print_success(f"[TEAM] 🚀 Member {uid_str}: ready → 1s → start (every 5s)")
+            
+            # Check if we're still a member
+            async with _global_team_lock:
+                p = _peer_registry.get(uid_str)
+                if not p or p.get("is_leader"): return
+                team = _team_slots.get(team_id)
+                if not team or uid_str not in team["members"]: return
+            
+            print_success(f"[TEAM] 🚀 Member {uid_str} starting ready→start loop for team {team_id[-8:]}")
             my_id = current_account_data.get('account_id', uid_str) if current_account_data else uid_str
             while _team_active["flag"]:
                 try:
                     if bot_state.is_paused(uid_str): break
+                    if _my_team_id["id"] != team_id: break
+                    
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                         try:
                             rdy = ready_for_game(int(my_id), current_key, current_iv)
@@ -1824,7 +1922,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                             if lv != current_level: current_level = lv
                         except Exception: pass
                     else:
-                        print_warning(f"[FUNC] Cache miss {uid_str} -> attempting re-login...")
+                        print_warning(f"[FUNC] Cache miss {uid_str} -> re-login...")
                         try:
                             if current_account_data.get('auth_uid'):
                                 cache_invalidate(str(current_account_data['auth_uid']))
@@ -1838,13 +1936,12 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                 current_token = await build_tcp_startup_packet(
                                     new_cred['account_id'], new_cred['token'], new_cred['server_time'],
                                     current_key, current_iv,
-                                    region=new_cred.get('region', account_region), typ='OnLine'
-                                )
-                                print_success(f"[FUNC] Re-login successful & cache renewed for {uid_str}")
+                                    region=new_cred.get('region', account_region), typ='OnLine')
+                                print_success(f"[FUNC] Re-login OK for {uid_str}")
                             else:
-                                raise ConnectionError("Re-login returned empty credentials")
+                                raise ConnectionError("Re-login empty")
                         except Exception as re_err:
-                            print_error(f"[FUNC] Re-login failed for {uid_str}: {re_err}")
+                            print_error(f"[FUNC] Re-login failed: {re_err}")
                             await asyncio.sleep(5)
                             raise ConnectionError("Cache expired")
 
@@ -1852,7 +1949,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     if uid_str in bot_state.accounts:
                         ll = int(bot_state.accounts[uid_str].get('level', current_level) or current_level)
                         if ll != current_level:
-                            print_info(f"[LEVEL] {uid_str}: {current_level} -> {ll}")
                             current_level = ll
                 except Exception: pass
 
@@ -1892,17 +1988,17 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 print_success(f"[FUNC] TCP connected {uid_str} (DNS:{rip} Lvl:{current_level} R:{current_search_region})")
                 reconnects = 0; no_response_count = 0; last_start_time = 0.0
 
-                async with _team_state["lock"]:
-                    _team_state["peers"][uid_str] = {
-                        "writer": writer, "data": current_account_data,
-                        "key": current_key, "iv": current_iv}
-                    if _team_state["leader_uid"] is None:
-                        _team_state["leader_uid"] = uid_str
-                        print_success(f"[TEAM] 👑 {uid_str} is leader")
+                # ⭐ REGISTER PEER & ASSIGN TEAM SLOT
+                await _register_peer(uid_str, writer, current_account_data, current_key, current_iv)
+                team_id, is_leader = await _try_assign_team(uid_str)
+                _my_team_id["id"] = team_id
+                _my_is_leader["flag"] = is_leader
 
-                if TEAM_MODE:
-                    team_coord_task = asyncio.create_task(_team_coordinator())
-                    member_trigger_task = asyncio.create_task(_member_match_trigger())
+                if TEAM_MODE and team_id:
+                    if is_leader:
+                        team_coord_task = asyncio.create_task(_team_coordinator())
+                    else:
+                        member_trigger_task = asyncio.create_task(_member_match_trigger())
                 else:
                     await start_game_battle_royale(current_search_region, client_version, writer, current_key, current_iv)
 
@@ -1938,16 +2034,13 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     pl = len(data)
                     no_response_count = 0
 
-                    if DEBUG_TEAM_PACKETS and not hex_data.startswith("0300") and not hex_data.startswith("0600"):
-                        print_info(f"[RAW-IN {uid_str}] len={pl} prefix={hex_data[:24]}")
-
                     if hex_data.startswith("0600") and pl > 20:
                         await _process_social_packet(data, current_account_data, tag="MAIN")
                         continue
 
                     if hex_data.startswith("05") and pl > 10:
                         await _handle_team_invite(hex_data, pl, uid_str, current_account_data,
-                                                  current_key, current_iv, writer)
+                                                  current_key, current_iv, writer, team_id)
                         continue
 
                     if hex_data.startswith("0300") and 10 < pl < 30:
@@ -1955,7 +2048,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
                     if hex_data.startswith("0300") and pl >= 300:
                         print_colored("=" * 60, Colors.GREEN)
-                        print_colored("MATCH FOUND! Loading...", Colors.GREEN)
+                        print_colored(f"MATCH FOUND! (Team {team_id[-8:] if team_id else '?'})", Colors.GREEN)
                         print_colored("=" * 60, Colors.GREEN)
 
                         for tk in (team_coord_task, member_trigger_task):
@@ -1985,19 +2078,11 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
                             effective = match_account_id or account_id or "BD_BOT"
                             if token and udp_key and match_code and server_ip_port:
-                                try:
-                                    async with _team_state["lock"]:
-                                        _team_state["pk_code"] = str(match_code)
-                                        _team_state["team_code"] = str(match_code)
-                                    print_colored(f"[PK] 🎯 Room Code: {match_code}", Colors.MAGENTA)
-                                    print_colored(f"[PK] 🌐 Server: {server_ip_port}", Colors.MAGENTA)
-                                    print_colored(f"[PK] 🔑 UDP Key: {udp_key}", Colors.MAGENTA)
-                                except Exception: pass
+                                print_colored(f"[PK] 🎯 Room Code: {match_code}", Colors.MAGENTA)
+                                print_colored(f"[PK] 🌐 Server: {server_ip_port}", Colors.MAGENTA)
 
                                 acc_tok = current_account_data.get('access_token', '') if current_account_data else ""
                                 mid, mp = BR_MODE_ID, BR_MAP_ID
-                                tag = "BATTLE_ROYALE"
-                                print_info(f"[TARGET] {tag} mid={mid} mp={mp}")
                                 thunder, sharma = await build_match_startup_packets(
                                     token, udp_key, match_code, effective, block_val or 0,
                                     server_ip=server_ip_port, region=account_region,
@@ -2005,7 +2090,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                     mode_id=mid, map_id=mp)
                                 match_index = await _inc_match(uid_str)
                                 total = await _get_total_match_count()
-                                print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} ({tag})", Colors.CYAN)
+                                print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port}", Colors.CYAN)
 
                                 new_match = asyncio.create_task(play_game(
                                     server_ip_port, thunder, sharma, udp_key, match_code,
@@ -2034,31 +2119,23 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                     except asyncio.CancelledError: pass
                                 play_matches[:] = [m for m in play_matches if not m.done()]
 
-                                async with _team_state["lock"]:
-                                    _team_state["peers"].pop(uid_str, None)
-                                    if _team_state["leader_uid"] == uid_str:
-                                        _team_state["leader_uid"] = None
-                                    _team_state["pk_code"] = None
+                                # ⭐ MATCH DONE — REMOVE FROM TEAM, RE-ASSIGN LATER
                                 await _team_member_leave(uid_str)
                                 _team_active["flag"] = True
                                 try: writer.close(); await writer.wait_closed()
                                 except Exception: pass
-                                print_info(f"[FUNC] {uid_str} reconnect in {NEW_MATCH_DELAY}s...")
+                                print_info(f"[FUNC] {uid_str} reconnect in {NEW_MATCH_DELAY}s (will re-join team)")
                                 await asyncio.sleep(NEW_MATCH_DELAY)
                                 reconnect_count_total += 1
                                 break
                             else:
                                 consecutive_parse_failures += 1
-                                print_warning(f"[FUNC] Non-match big pkt #{consecutive_parse_failures}")
-                                if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
-                                    consecutive_parse_failures = 0
                                 try: writer.close(); await writer.wait_closed()
                                 except Exception: pass
                                 await asyncio.sleep(NON_MATCH_RECONNECT_DELAY)
                                 break
                         except Exception as e:
                             print_error(f"[FUNC] Match parse: {e}")
-                            consecutive_parse_failures += 1
                             try: writer.close(); await writer.wait_closed()
                             except Exception: pass
                             await asyncio.sleep(NON_MATCH_RECONNECT_DELAY)
@@ -2067,18 +2144,13 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     if 30 <= pl <= 40: continue
 
             except asyncio.CancelledError:
-                print_warning(f"[FUNC] Cancelled — cancel {len(play_matches)} UDP")
                 for m in play_matches:
                     if not m.done(): m.cancel()
                 if play_matches:
                     await asyncio.gather(*play_matches, return_exceptions=True)
                 play_matches.clear()
                 if gateway_ping_task: gateway_ping_task.cancel()
-                async with _team_state["lock"]:
-                    _team_state["peers"].pop(uid_str, None)
-                    if _team_state["leader_uid"] == uid_str:
-                        _team_state["leader_uid"] = None
-                await _team_member_leave(uid_str)
+                await _unregister_peer(uid_str)
                 raise
             except Exception as e:
                 if gateway_ping_task: gateway_ping_task.cancel()
@@ -2088,7 +2160,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     try: writer.close(); await writer.wait_closed()
                     except Exception: pass
                 if "Cache expired" in str(e):
-                    print_warning(f"[FUNC] re-login {uid_str}")
                     break
                 reconnect_count_total += 1
                 reconnects += 1
@@ -2108,11 +2179,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 if writer:
                     try: writer.close(); await writer.wait_closed()
                     except Exception: pass
-                async with _team_state["lock"]:
-                    _team_state["peers"].pop(uid_str, None)
-                    if _team_state["leader_uid"] == uid_str:
-                        _team_state["leader_uid"] = None
-                await _team_member_leave(uid_str)
+                await _unregister_peer(uid_str)
                 _team_active["flag"] = True
     except asyncio.CancelledError:
         for m in play_matches:
@@ -2204,12 +2271,6 @@ async def refresh_account_profile(ad_or_uid):
         exp = exp if exp is not None else 0
         likes = likes if likes is not None else 0
         acc_id = str(ad['account_id'])
-        old_lv = 0; old_ex = 0
-        try:
-            if acc_id in bot_state.accounts:
-                old_lv = int(bot_state.accounts[acc_id].get('level', 0) or 0)
-                old_ex = int(bot_state.accounts[acc_id].get('exp', 0) or 0)
-        except Exception: pass
         try: bot_state.update_exp(acc_id, exp, level)
         except Exception: pass
         if likes > 0 and acc_id in bot_state.accounts:
@@ -2218,12 +2279,6 @@ async def refresh_account_profile(ad_or_uid):
             bot_state.accounts[acc_id]["nickname"] = nick
         _update_cache_profile(ad, level, exp)
         ad['level'] = level; ad['exp'] = exp
-        if likes > 0: ad['likes'] = likes
-        if nick: ad['nickname'] = nick
-        if old_lv > 0 and level > old_lv:
-            print_success(f"[LEVEL UP] {acc_id}: {old_lv} -> {level}")
-        elif old_ex != exp:
-            print_success(f"[EXP] {acc_id} Lvl{level} +{exp - old_ex}")
     except Exception: pass
 
 async def process_account_uid_pass(uid, password):
@@ -2261,7 +2316,7 @@ async def process_account_uid_pass(uid, password):
         region = mresp.region or get_proto_field(dd, 3, "ID")
         bot_state.register_account(uid=acc_id, nickname=nick, region=region,
                                     level=level, exp=exp, likes=likes)
-        print_success(f"[OK] {acc_id} | {nick} | Lvl{level} | 2v2 BATTLE ROYALE")
+        print_success(f"[OK] {acc_id} | {nick} | Lvl{level}")
         ad = {
             'account_id': mresp.account_id, 'nickname': nick, 'region': region,
             'level': level, 'exp': exp, 'likes': likes,
@@ -2277,7 +2332,7 @@ async def process_account_uid_pass(uid, password):
         _register_credentials(ad); cache_set(uid, ad); return ad
     except Exception as e:
         print_error(f"process_account_uid_pass: {e}")
-        traceback.print_exc(); return None
+        return None
 
 async def process_account_token(access_token):
     cache_key = f"tok_{access_token[:20]}"
@@ -2433,14 +2488,14 @@ def load_accounts():
 # ═══════════════════════════ MAIN ═══════════════════════════
 async def main():
     print_colored("=" * 60, Colors.CYAN)
-    print_colored("  TEAM RBC — 2v2 Squad Bot (Create/Invite/Accept/PK)", Colors.GREEN)
+    print_colored("  TEAM RBC — 2v2 PARALLEL Squad Bot", Colors.GREEN)
     print_colored("=" * 60, Colors.CYAN)
     print_info(f"Match interval: {START_MATCH_INTERVAL}s | Offline: {NEW_MATCH_DELAY}s")
-    print_info("Mode: 2v2 BATTLE ROYALE")
+    print_info("Mode: 2v2 PARALLEL (Multiple teams run simultaneously)")
     if TEAM_MODE:
-        print_success(f"[SQUAD] size={TEAM_SIZE} (2v2 MODE) peer_wait={TEAM_PEER_WAIT_TIMEOUT}s")
-        print_info(f"  invite_cycle={TEAM_INVITE_CYCLE_WAIT}s | max_time={TEAM_INVITE_MAX_TIME}s")
-        print_info(f"  heartbeat={TEAM_HEARTBEAT_INTERVAL}s | final_wait={TEAM_FINAL_WAIT}s")
+        print_success(f"[SQUAD] size={TEAM_SIZE} (2v2 MODE)")
+        print_info(f"  Team rule: 2 peers per team. Multiple teams = multiple matches simultaneously.")
+        print_info(f"  Example: 8 accounts → 4 teams → 4 simultaneous 2v2 matches")
     print_colored("=" * 60, Colors.CYAN)
 
     try:
