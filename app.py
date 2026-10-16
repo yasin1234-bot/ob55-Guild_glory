@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════
-#  TEAM RBC — Squad Bot (Create → Invite → Accept → PK → In-Game)
+#  TEAM RBC — Squad Bot (2v2 Mode - Create → Invite → Accept → PK)
 # ═══════════════════════════════════════════════════════════════════
 import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid
 import itertools, secrets, traceback, base64
@@ -85,9 +85,9 @@ PING_REAL_IP     = "103.109.214.211"
 FALLBACK_UID = ""
 FALLBACK_PASSWORD = ""
 
-# ═══════════════════════════ SQUAD CONFIG ═══════════════════════════
+# ═══════════════════════════ 2v2 SQUAD CONFIG ═══════════════════════════
 TEAM_MODE               = True
-TEAM_SIZE               = 4
+TEAM_SIZE               = 2          # ⭐ 2v2 MODE
 TEAM_PEER_WAIT_TIMEOUT  = 90.0
 TEAM_CREATE_WAIT        = 4.0
 TEAM_INVITE_CYCLE_WAIT  = 4.0
@@ -96,9 +96,8 @@ TEAM_HEARTBEAT_INTERVAL = 3.0
 TEAM_IDLE_ITERS_TEAM    = 1800
 TEAM_MEMBER_START_DELAY = 20.0
 TEAM_FINAL_WAIT         = 8.0
-TEAM_SIZE = 4
-TEAM_READY_DELAY = 5.0
-_accept_friend_request = True
+TEAM_READY_DELAY        = 5.0
+_accept_friend_request  = True
 DEBUG_TEAM_PACKETS      = True
 
 # ═══════════════════════════ ANTI-BAN ═══════════════════════════
@@ -491,7 +490,6 @@ def _recursive_dict(results):
     return out
 
 def _decode_proto_manual(data):
-    """Manual protobuf decode (fallback)."""
     result = {}; offset = 0; data_len = len(data)
     while offset < data_len:
         header = 0; shift = 0
@@ -798,7 +796,7 @@ async def send_keep_alive(region="ID"):
 BR_HEX = (
     "080112800a0a010110013a110a044944433110aa011a064555524f50453a100a044944433210311a064555524f5045"
     "40014a0801090a0b1219202758016291090a80013038384638324246303241393637363730323031303130303030"
-    "30303030303030303031363030303130303135303030323232463937454545304630303030303034363736323531"
+    "303030303030303030303030303031363030303130303135303030323232463937454545304630303030303034363736323531"
     "34303030303030303030303030303030303030303030303030303030303030303030303030306666303030303030"
     "3030636163666131366410241afb02735d5e571400024a775d45414d1a041b1c001f11010449715f4243481a001e"
     "1d071c1703004b1a4066785c524570735c51486775421b5c5a4c07504042685a63610816054e19025e7519600147"
@@ -1614,7 +1612,7 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
         print_warning(f"[TEAM-IN {uid_str}] error: {e}")
         return False
 
-# ═══════════════════════════ FUNCTIONAL (MAIN) — BATTLE ROYALE ONLY ═══════════════════════════
+# ═══════════════════════════ FUNCTIONAL (MAIN) — 2v2 BATTLE ROYALE ═══════════════════════════
 async def functional_battle_royale(addrs, starter_packet, account_region, client_version,
                                     key, iv, account_id="", account_data=None,
                                     account_level=2, max_reconnects=10):
@@ -1832,8 +1830,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                 cache_invalidate(str(current_account_data['auth_uid']))
                             if current_account_data.get('auth_token'):
                                 cache_invalidate(f"tok_{current_account_data['auth_token'][:20]}")
-                            
-                            # Trigger fresh login to renew credentials
                             new_cred = await bot_state.relogin_account(uid_str, current_account_data)
                             if new_cred:
                                 current_account_data = new_cred
@@ -1859,7 +1855,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                             print_info(f"[LEVEL] {uid_str}: {current_level} -> {ll}")
                             current_level = ll
                 except Exception: pass
-
 
                 rip = await resolve_host_cloudflare(ip)
                 reader, writer = await asyncio.open_connection(rip, int(port))
@@ -1909,7 +1904,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     team_coord_task = asyncio.create_task(_team_coordinator())
                     member_trigger_task = asyncio.create_task(_member_match_trigger())
                 else:
-                    # ⭐ Always Battle Royale
                     await start_game_battle_royale(current_search_region, client_version, writer, current_key, current_iv)
 
                 while True:
@@ -2001,7 +1995,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                 except Exception: pass
 
                                 acc_tok = current_account_data.get('access_token', '') if current_account_data else ""
-                                # ⭐ Always Battle Royale
                                 mid, mp = BR_MODE_ID, BR_MAP_ID
                                 tag = "BATTLE_ROYALE"
                                 print_info(f"[TARGET] {tag} mid={mid} mp={mp}")
@@ -2268,7 +2261,7 @@ async def process_account_uid_pass(uid, password):
         region = mresp.region or get_proto_field(dd, 3, "ID")
         bot_state.register_account(uid=acc_id, nickname=nick, region=region,
                                     level=level, exp=exp, likes=likes)
-        print_success(f"[OK] {acc_id} | {nick} | Lvl{level} | BATTLE ROYALE")
+        print_success(f"[OK] {acc_id} | {nick} | Lvl{level} | 2v2 BATTLE ROYALE")
         ad = {
             'account_id': mresp.account_id, 'nickname': nick, 'region': region,
             'level': level, 'exp': exp, 'likes': likes,
@@ -2371,7 +2364,6 @@ async def run_account_worker(ad, label):
                     if f: await refresh_account_profile(f)
                 except Exception: pass
         exp_task = asyncio.create_task(exp_refresher())
-        # ⭐ Always Battle Royale
         await functional_battle_royale(ad['functional_addrs'], tcp_online, ad['region'], ad['client_version'],
             ad['aes_ak'], ad['iv_i'], account_id=acc_id, account_data=ad,
             account_level=int(ad.get('level', 2) or 2))
@@ -2441,12 +2433,12 @@ def load_accounts():
 # ═══════════════════════════ MAIN ═══════════════════════════
 async def main():
     print_colored("=" * 60, Colors.CYAN)
-    print_colored("  TEAM RBC — Squad Bot (Create/Invite/Accept/PK)", Colors.GREEN)
+    print_colored("  TEAM RBC — 2v2 Squad Bot (Create/Invite/Accept/PK)", Colors.GREEN)
     print_colored("=" * 60, Colors.CYAN)
     print_info(f"Match interval: {START_MATCH_INTERVAL}s | Offline: {NEW_MATCH_DELAY}s")
-    print_info("Mode: BATTLE ROYALE ONLY")
+    print_info("Mode: 2v2 BATTLE ROYALE")
     if TEAM_MODE:
-        print_success(f"[SQUAD] size={TEAM_SIZE} peer_wait={TEAM_PEER_WAIT_TIMEOUT}s")
+        print_success(f"[SQUAD] size={TEAM_SIZE} (2v2 MODE) peer_wait={TEAM_PEER_WAIT_TIMEOUT}s")
         print_info(f"  invite_cycle={TEAM_INVITE_CYCLE_WAIT}s | max_time={TEAM_INVITE_MAX_TIME}s")
         print_info(f"  heartbeat={TEAM_HEARTBEAT_INTERVAL}s | final_wait={TEAM_FINAL_WAIT}s")
     print_colored("=" * 60, Colors.CYAN)

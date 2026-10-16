@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-FreeFire Level Up Bot - Professional Web Dashboard & Real-Time EXP Tracker
+FreeFire 2v2 Squad Bot - Professional Web Dashboard & Real-Time Guild Tracker
+100% REAL GUILD DATA - NO FAKE/FALLBACK DATA
 Embedded Async Web Server (aiohttp)
-Optimized for ultra-smooth operation, zero memory leaks, and dynamic multi-account control.
 """
 
 import asyncio
@@ -76,6 +76,7 @@ def get_server_url(region):
     return info[0] if isinstance(info, tuple) else info
 
 def fetch_single_clan(clan_id, region, token_cache):
+    """Fetch REAL clan data from game server - NO FALLBACK"""
     server_base, host = get_server_info(region)
     url = f"{server_base}/GetClanInfoByClanID"
 
@@ -85,9 +86,10 @@ def fetch_single_clan(clan_id, region, token_cache):
         my_data.field2 = 1  
         payload = encrypt_payload(my_data.SerializeToString())  
     except Exception as e:
-        return {"clan_id": clan_id, "error": f"Protobuf failed: {str(e)}"}
+        return {"error": f"Protobuf failed: {str(e)}"}
 
     response = None
+    last_error = None
     for uid, creds in token_cache.items():
         token = creds.get('token')
         if not token:
@@ -103,15 +105,18 @@ def fetch_single_clan(clan_id, region, token_cache):
                 response = res
                 break
             elif "expired" in res.text.lower() or res.status_code == 401:
+                last_error = f"Token expired for {uid}"
                 continue
             else:
+                last_error = f"HTTP {res.status_code}: {res.text[:100]}"
                 response = res
                 break
         except Exception as ex:
+            last_error = str(ex)
             continue
 
     if not response or response.status_code != 200:
-        return {"clan_id": clan_id, "error": "All tokens failed or expired"}
+        return {"error": f"All tokens failed: {last_error or 'No valid token'}"}
 
     full_response = {}
     resp = None
@@ -120,7 +125,7 @@ def fetch_single_clan(clan_id, region, token_cache):
         resp.ParseFromString(response.content)  
         full_response = MessageToDict(resp, preserving_proto_field_name=True)
     except Exception as e:
-        pass
+        return {"error": f"Parse failed: {str(e)}"}
 
     guild_xp = 0
     if resp:
@@ -132,14 +137,24 @@ def fetch_single_clan(clan_id, region, token_cache):
     if guild_xp == 0 and full_response:
         guild_xp = int(full_response.get("field_36") or full_response.get("xp") or 0)
 
+    # REAL clan name from special_code or name field
+    clan_name = ""
+    if resp:
+        try:
+            clan_name = resp.special_code or ""
+        except Exception:
+            pass
+    if not clan_name:
+        clan_name = full_response.get("special_code") or full_response.get("name") or ""
+
     return {
         "captain_id": getattr(resp, "captain_id", 0) if resp else full_response.get("captain_id", 0),
         "clan_id": int(clan_id),
-        "clan_level": getattr(resp, "rank", 4) if resp else full_response.get("rank", 4),
-        "clan_name": getattr(resp, "special_code", None) if resp else (full_response.get("special_code") or f"Guild_{clan_id}"),
+        "clan_level": getattr(resp, "rank", 0) if resp else full_response.get("rank", 0),
+        "clan_name": clan_name,
         "current_officer": full_response.get("current_officer", 0),
-        "current_members": full_response.get("current_members", 1),                
-        "max_members": full_response.get("max_members", 50),
+        "current_members": full_response.get("current_members", 0),                
+        "max_members": full_response.get("max_members", 0),
         "Total guild xp": int(guild_xp),
         "welcome_message": getattr(resp, "welcome_message", "") if resp else full_response.get("welcome_message", ""),
         "region": region,
@@ -188,7 +203,6 @@ async def handle_index(request: web.Request) -> web.Response:
             pass
     return web.Response(text=content, content_type="text/html", charset="utf-8")
 
-
 async def handle_get_stats(request: web.Request) -> web.Response:
     accounts_data = list(bot_state.accounts.values())
     accounts_data.sort(key=lambda x: x.get("gained_exp", 0), reverse=True)
@@ -202,16 +216,23 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         acc["uptime_seconds"] = bot_state.get_account_uptime(uid_k)
         acc["is_paused"] = bot_state.is_paused(uid_k)
 
+    # Get first account's region for guild info
+    region = "BD"
+    if accounts_data:
+        region = accounts_data[0].get("region", "BD").upper()
+
     return web.json_response({
         "total_accounts": len(bot_state.accounts),
         "total_matches": bot_state.total_matches,
-        "total_matches_started": bot_state.total_matches_started,   # 🔥 NEW
+        "total_matches_started": bot_state.total_matches_started,
         "total_active_matches": total_active_matches,
         "total_gained_exp": total_gained,
         "exp_per_hour": exp_per_hour,
         "accounts": accounts_data,
         "logs": bot_state.logs[-80:],
-        "uptime": uptime_sec
+        "uptime": uptime_sec,
+        "default_region": region,
+        "team_size": 2  # 2v2 MODE
     })
 
 def calculate_level_progress(level: int, current_exp: int) -> Dict[str, Any]:
@@ -241,13 +262,13 @@ class BotState:
         self.logs: List[Dict[str, Any]] = []
         self.max_logs = 200
         self.total_matches = 0
-        self.total_matches_started = 0      # 🔥 NEW
+        self.total_matches_started = 0
         self.total_gained_exp = 0
         self.start_time = time.time()
         self.account_workers: Dict[str, asyncio.Task] = {}
-        self.account_token_map: Dict[str, str] = {}  # uid -> token or token_prefix -> uid
-        self.auth_to_game_id: Dict[str, str] = {}   # guest login uid -> in-game account id
-        self.game_to_auth_id: Dict[str, str] = {}   # in-game account id -> guest login uid
+        self.account_token_map: Dict[str, str] = {}
+        self.auth_to_game_id: Dict[str, str] = {}
+        self.game_to_auth_id: Dict[str, str] = {}
         self.paused_accounts: set = set()
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
@@ -321,8 +342,8 @@ class BotState:
         prog = calculate_level_progress(level or 1, exp)
 
         lvl_val = level or 1
-        acc_mode = "BR" if lvl_val < 3 else "LONE_WOLF"
-        acc_mode_label = "Battle Royale (Lvl < 3)" if lvl_val < 3 else "Lone Wolf (Lvl 3+)"
+        acc_mode = "2v2_BR"
+        acc_mode_label = "2v2 Battle Royale"
 
         if uid_str not in self.accounts:
             self.accounts[uid_str] = {
@@ -483,8 +504,8 @@ class BotState:
             acc["gained_exp"] = max(0, current_exp - acc["initial_exp"])
             
             current_lvl = acc["level"]
-            acc["mode"] = "BR" if current_lvl < 3 else "LONE_WOLF"
-            acc["mode_label"] = "Battle Royale (Lvl < 3)" if current_lvl < 3 else "Lone Wolf (Lvl 3+)"
+            acc["mode"] = "2v2_BR"
+            acc["mode_label"] = "2v2 Battle Royale"
 
             prog = calculate_level_progress(acc["level"], current_exp)
             acc["next_level"] = prog["next_level"]
@@ -495,10 +516,9 @@ class BotState:
             acc["progress_pct"] = prog["progress_pct"]
             acc["last_updated"] = time.strftime("%H:%M:%S")
 
-            # Check for Level 2 -> 3 Mode Transition
-            if old_level < 3 and current_lvl >= 3:
+            if old_level < current_lvl:
                 self.log(
-                    f"🎉 LEVEL UP! UID {uid_str} ({acc['nickname']}) reached Level {current_lvl}! Switching from Battle Royale to Lone Wolf mode!",
+                    f"🎉 LEVEL UP! UID {uid_str} ({acc['nickname']}) reached Level {current_lvl}!",
                     "success",
                     uid_str
                 )
@@ -524,8 +544,7 @@ class BotState:
         return 1
 
     def get_account_mode(self, uid: str) -> str:
-        lvl = self.get_account_level(uid)
-        return "BR" if lvl < 3 else "LONE_WOLF"
+        return "2v2_BR"
 
     def update_status(self, uid: str, status: str, active_matches: Optional[int] = None):
         uid_str = str(uid)
@@ -535,9 +554,7 @@ class BotState:
                 self.accounts[uid_str]["active_matches"] = active_matches
             self.accounts[uid_str]["last_updated"] = time.strftime("%H:%M:%S")
 
-
     def increment_match_started(self):
-        """Track total matches STARTED (not completed)"""
         self.total_matches_started += 1
 
     def increment_match(self, uid: str):
@@ -552,65 +569,18 @@ class BotState:
     def recalc_totals(self):
         self.total_gained_exp = sum(acc.get("gained_exp", 0) for acc in self.accounts.values())
 
-
 bot_state = BotState()
 
 FALLBACK_INDEX_HTML = """<!DOCTYPE html>
 <html>
-<head><title>TEAM RBC Bot Dashboard</title></head>
+<head><title>TEAM RBC 2v2 Bot Dashboard</title></head>
 <body style="background:#0a0a12;color:#fff;font-family:sans-serif;text-align:center;padding:50px;">
-<h1>TEAM RBC BOT RUNNING</h1>
+<h1>TEAM RBC 2v2 BOT RUNNING</h1>
 <p>Dashboard interface loaded successfully.</p>
 </body>
 </html>"""
 
-async def handle_index(request: web.Request) -> web.Response:
-    content = FALLBACK_INDEX_HTML
-    if os.path.exists(TEMPLATE_PATH):
-        try:
-            with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception:
-            pass
-    return web.Response(text=content, content_type="text/html", charset="utf-8")
-
-# ==================== CLAN JOIN API ENDPOINT (AIOHTTP) ====================
-async def handle_api_clan_join(request: web.Request) -> web.Response:
-    try:
-        data = await request.json()
-        clan_id = data.get('clan_id')
-        if not clan_id:
-            return web.json_response({'error': 'Clan ID is required'}, status=400)
-        
-        try:
-            with open("token_cache.json", "r", encoding="utf-8") as f:
-                token_cache = json.load(f)
-        except Exception as e:
-            return web.json_response({'error': f'Failed to load token_cache.json: {str(e)}'}, status=500)
-
-        success_count = 0
-        total_accounts = 0
-        for uid, creds in token_cache.items():
-            jwt_token = creds.get('token')
-            region = creds.get('region', 'IND')
-            if not jwt_token:
-                continue
-            
-            total_accounts += 1
-            try:
-                status_code, text_resp = await request_clan_async(jwt_token, clan_id, region)
-                if status_code == 200:
-                    success_count += 1
-            except Exception:
-                pass
-
-        return web.json_response({
-            'message': f'Clan join requests sent successfully for {success_count} / {total_accounts} accounts!'
-        }, status=200)
-    except Exception as e:
-        return web.json_response({'error': str(e)}, status=500)
-
-# ==================== GUILD INFO API ENDPOINT (AIOHTTP) ====================
+# ==================== GUILD INFO API ENDPOINT ====================
 GUILD_CACHE_FILE = "guild_exp_cache.json"
 
 def load_guild_cache():
@@ -645,9 +615,12 @@ def get_persisted_baseline_xp(clan_id, current_xp):
     return int(cache[clan_key]["old_xp"])
 
 async def handle_api_guild_info(request: web.Request) -> web.Response:
+    """
+    100% REAL GUILD DATA - NO FAKE/FALLBACK VALUES
+    """
     try:
         clan_id = request.query.get('guild_id') or request.query.get('clan_uid') or request.query.get('clan_id')
-        region = (request.query.get('region') or 'IND').upper()
+        region = (request.query.get('region') or 'BD').upper()
         api_key = request.query.get('key')
 
         if not api_key or api_key != "XEROX_MODS":
@@ -656,6 +629,7 @@ async def handle_api_guild_info(request: web.Request) -> web.Response:
         if not clan_id:
             return web.json_response({"error": "guild_id is required"}, status=400)
 
+        # Load token cache
         try:
             with open("token_cache.json", "r", encoding="utf-8") as f:
                 token_cache = json.load(f)
@@ -665,15 +639,16 @@ async def handle_api_guild_info(request: web.Request) -> web.Response:
         if not token_cache:
             return web.json_response({"error": "token_cache.json is empty"}, status=503)
 
+        # Fetch REAL clan data
         clan_data = fetch_single_clan(clan_id, region, token_cache)
         if "error" in clan_data:
-            return web.json_response(clan_data, status=500)
+            return web.json_response({"error": clan_data["error"]}, status=500)
 
         current_xp = int(clan_data.get("Total guild xp") or clan_data.get("xp") or 0)
         baseline_xp = get_persisted_baseline_xp(clan_id, current_xp)
         gained_exp = current_xp - baseline_xp
 
-        # Cache update
+        # Update cache
         cache = load_guild_cache()
         cache[str(clan_id)] = {
             "old_xp": baseline_xp,
@@ -685,11 +660,12 @@ async def handle_api_guild_info(request: web.Request) -> web.Response:
         clan_data["old_xp"] = baseline_xp
         clan_data["gained_exp"] = gained_exp
 
+        # Return REAL data only
         api_response_body = {
-            "DEVLOVER": "XEROX_MODS",
-            "TELEGRAM": "SEXTYMODS",
-            "TIME AND DATE": time.strftime("%I:%M %p, %A, %B %d, %Y"),
-            "clan_basic_info": clan_data
+            "clan_basic_info": clan_data,
+            "old_xp": baseline_xp,
+            "live_xp": current_xp,
+            "gained_exp": gained_exp
         }
 
         return web.json_response({  
@@ -701,7 +677,6 @@ async def handle_api_guild_info(request: web.Request) -> web.Response:
 
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
 
 async def handle_add_account(request: web.Request) -> web.Response:
     try:
@@ -721,7 +696,6 @@ async def handle_add_account(request: web.Request) -> web.Response:
             if not uid or not pwd:
                 return web.json_response({"status": "error", "error": "UID and Password are required"})
 
-            # Cancel previous worker if already running for this UID
             if uid in bot_state.account_workers:
                 try:
                     bot_state.account_workers[uid].cancel()
@@ -738,7 +712,6 @@ async def handle_add_account(request: web.Request) -> web.Response:
             if not token:
                 return web.json_response({"status": "error", "error": "Token is required"})
 
-            # Cancel worker if token prefix matches
             tok_key = token[:16]
             for k in list(bot_state.account_workers.keys()):
                 if k == tok_key or k.startswith(tok_key[:10]) or tok_key.startswith(k[:10]):
@@ -759,14 +732,12 @@ async def handle_add_account(request: web.Request) -> web.Response:
 
         bot_state.log(f"New account added to rotation: {identifier}", "success")
         
-        # Trigger dynamic worker launch in Main.py
         if "on_account_added" in bot_state.refresh_callbacks:
             asyncio.create_task(bot_state.refresh_callbacks["on_account_added"](data))
 
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
-
 
 async def handle_delete_account(request: web.Request) -> web.Response:
     try:
@@ -776,21 +747,18 @@ async def handle_delete_account(request: web.Request) -> web.Response:
         if not req_uid and not req_auth_uid:
             return web.json_response({"status": "error", "error": "UID is required"})
 
-        # Collect ALL possible candidate identifiers for this account
         candidate_ids = set()
         if req_uid:
             candidate_ids.add(req_uid)
         if req_auth_uid:
             candidate_ids.add(req_auth_uid)
 
-        # Check game_to_auth and auth_to_game mappings
         for cid in list(candidate_ids):
             if cid in bot_state.game_to_auth_id:
                 candidate_ids.add(str(bot_state.game_to_auth_id[cid]))
             if cid in bot_state.auth_to_game_id:
                 candidate_ids.add(str(bot_state.auth_to_game_id[cid]))
 
-        # Inspect bot_state.accounts
         target_tokens = set()
         for cid in list(candidate_ids):
             acc_info = bot_state.accounts.get(cid, {})
@@ -803,7 +771,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                 if t:
                     target_tokens.add(str(t))
 
-        # Inspect bot_state.account_credentials
         for cid in list(candidate_ids):
             creds = bot_state.account_credentials.get(cid, {})
             if creds:
@@ -815,7 +782,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                 if t:
                     target_tokens.add(str(t))
 
-        # Also clean token_cache.json if entries match
         token_cache_file = "token_cache.json"
         if os.path.exists(token_cache_file):
             try:
@@ -840,7 +806,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             except Exception:
                 pass
 
-        # Remove from accounts.json
         accounts_file = "accounts.json"
         if os.path.exists(accounts_file):
             try:
@@ -866,7 +831,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             except Exception:
                 pass
 
-        # Remove matching devices from devices.json
         devices_file = "devices.json"
         if os.path.exists(devices_file):
             try:
@@ -890,7 +854,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             except Exception:
                 pass
 
-        # Remove from in-memory bot_state.accounts & credentials
         for cid in candidate_ids:
             bot_state.accounts.pop(cid, None)
             bot_state.account_credentials.pop(cid, None)
@@ -898,7 +861,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             bot_state.game_to_auth_id.pop(cid, None)
             bot_state.account_token_map.pop(cid, None)
 
-        # Cancel matching worker tasks
         cancelled_keys = []
         for k, worker in list(bot_state.account_workers.items()):
             k_str = str(k)
@@ -921,7 +883,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
         for cid in candidate_ids:
             bot_state.close_writers_for_account(cid)
 
-        # Trigger on_account_deleted callback in Main.py if registered
         if "on_account_deleted" in bot_state.refresh_callbacks:
             try:
                 asyncio.create_task(bot_state.refresh_callbacks["on_account_deleted"](list(candidate_ids)))
@@ -935,7 +896,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
-
 async def handle_refresh_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -945,7 +905,6 @@ async def handle_refresh_account(request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
-
 
 async def handle_restart_account(request: web.Request) -> web.Response:
     try:
@@ -959,11 +918,9 @@ async def handle_restart_account(request: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
-
 async def handle_clear_logs(request: web.Request) -> web.Response:
     bot_state.logs.clear()
     return web.json_response({"status": "ok"})
-
 
 async def handle_toggle_pause(request: web.Request) -> web.Response:
     try:
@@ -975,7 +932,6 @@ async def handle_toggle_pause(request: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "is_paused": is_paused})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
-
 
 async def handle_toggle_pause_all(request: web.Request) -> web.Response:
     try:
@@ -997,13 +953,10 @@ async def handle_api_logs(request: web.Request) -> web.Response:
             formatted_logs.append(str(entry))
     return web.json_response({"logs": formatted_logs}, status=200)
 
-
 # ==================== START WEB DASHBOARD ====================
-
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app = web.Application()
     app.router.add_get("/", handle_index)
-    app.router.add_post("/api/clanjoin", handle_api_clan_join)
     app.router.add_get("/api/guildinfo", handle_api_guild_info)
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_get("/api/logs", handle_api_logs)
