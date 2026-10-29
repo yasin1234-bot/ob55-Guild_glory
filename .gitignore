@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-accounts.json
-token_cache.json
-.env
